@@ -1,0 +1,2 @@
+liblouis-dev
+python3-louis
