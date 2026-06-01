@@ -1,0 +1,252 @@
+import numpy as np
+import cv2
+import streamlit as st
+import psutil
+
+from components.camera_component import camera_component
+from pipeline.preprocessor import preprocess
+from pipeline.detector import load_onnx_session, detect_hough, detect_onnx, ensemble
+from pipeline.grid import reconstruct_grid, _cluster_1d
+from pipeline.corrector import estimate_skew, correct_skew
+from pipeline.translator import translate
+from utils.image_utils import decode_frame, encode_frame, letterbox, draw_dots
+from utils.quality import blur_score, brightness, dot_density, get_guidance
+
+MODEL_PATH = "models/yolov8n_braille.onnx"
+_COUNTER_KEY = "frame_counter"
+
+# ─── Page config (must be first Streamlit call) ───────────────────────────────
+st.set_page_config(
+    page_title="Braille Scanner",
+    page_icon="⠃",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+# ─── Load shared resources once per process ───────────────────────────────────
+@st.cache_resource
+def _load_model():
+    return load_onnx_session(MODEL_PATH)
+
+onnx_session = _load_model()
+
+# ─── Sidebar settings ─────────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("Settings")
+    grade = st.selectbox(
+        "Braille Grade",
+        options=["grade2", "grade1", "nemeth", "computer"],
+        format_func=lambda x: {
+            "grade2": "Grade 2 (UEB contracted)",
+            "grade1": "Grade 1 (uncontracted)",
+            "nemeth": "Nemeth (math)",
+            "computer": "Computer (8-dot)",
+        }[x],
+        index=0,
+    )
+    auto_speak    = st.checkbox("Auto-speak translation", value=True)
+    speak_guide   = st.checkbox("Speak camera guidance", value=False)
+    high_contrast = st.checkbox("High contrast", value=False)
+    large_text    = st.checkbox("Large text", value=False)
+
+# ─── CSS injection ────────────────────────────────────────────────────────────
+_bg = "#000" if high_contrast else "#fff"
+_fg = "#fff" if high_contrast else "#000"
+_sz = "1.4em" if large_text  else "1em"
+st.markdown(f"""
+<style>
+section[data-testid="stMain"] > div {{ background: {_bg}; color: {_fg}; }}
+.translation-box {{ font-size: {_sz}; font-family: monospace; }}
+</style>
+""", unsafe_allow_html=True)
+
+# ─── Title ────────────────────────────────────────────────────────────────────
+st.title("⠃ Braille Scanner")
+if onnx_session is None:
+    st.caption("Hough-only mode (ONNX model not found — place yolov8n_braille.onnx in models/)")
+
+# ─── Session state init ───────────────────────────────────────────────────────
+if "last_result" not in st.session_state:
+    st.session_state.last_result = {
+        "text": "",
+        "confidence": 0.0,
+        "guidance": {"status": "ok", "message": "Ready — point camera at Braille"},
+    }
+if _COUNTER_KEY not in st.session_state:
+    st.session_state[_COUNTER_KEY] = 0
+
+
+# ─── Pipeline helper ──────────────────────────────────────────────────────────
+def run_pipeline(raw_bgr: np.ndarray, counter: int, selected_grade: str) -> dict:
+    """Full pipeline on a raw BGR frame. Returns result dict."""
+    # Downscale if memory is tight (free-tier safeguard)
+    mem = psutil.virtual_memory()
+    target_size = 480 if mem.used > 700 * 1024 * 1024 else 640
+
+    frame_s, scale, (pad_x, pad_y) = letterbox(raw_bgr, target_size)
+
+    # Dynamic CLAHE based on brightness
+    gray_quick = cv2.cvtColor(frame_s, cv2.COLOR_BGR2GRAY)
+    bright = brightness(gray_quick)
+    clip = 3.5 if bright < 40 else (1.0 if bright > 210 else 2.0)
+
+    binary, gray = preprocess(frame_s, clip_limit=clip)
+
+    # Stage 2A: Hough every cycle
+    hough_raw = detect_hough(binary, gray)
+
+    # Stage 2B: ONNX every 3rd cycle
+    if onnx_session and counter % 3 == 0:
+        onnx_raw = detect_onnx(frame_s, onnx_session)
+        confirmed = ensemble(hough_raw, onnx_raw)
+    else:
+        confirmed = [(x, y, 0.45) for x, y, r in hough_raw]
+
+    # Quality signals
+    b_score = blur_score(gray)
+    density = dot_density(confirmed, target_size, target_size)
+    skew = 0.0
+
+    # Skew correction if enough dots
+    if len(confirmed) >= 4:
+        ys = np.array([d[1] for d in confirmed])
+        row_labels = _cluster_1d(ys, gap=20.0)
+        skew = estimate_skew(confirmed, row_labels)
+        if abs(skew) > 5.0:
+            frame_s = correct_skew(frame_s, skew)
+            binary, gray = preprocess(frame_s, clip_limit=clip)
+            hough_raw = detect_hough(binary, gray)
+            if onnx_session and counter % 3 == 0:
+                onnx_raw = detect_onnx(frame_s, onnx_session)
+                confirmed = ensemble(hough_raw, onnx_raw)
+            else:
+                confirmed = [(x, y, 0.45) for x, y, r in hough_raw]
+
+    guidance = get_guidance(b_score, bright, density, skew)
+
+    # Draw dot overlays
+    draw_list = [(x, y, 5.0) for x, y, _ in confirmed]
+    annotated = draw_dots(frame_s, draw_list)
+    annotated_b64 = encode_frame(annotated)
+
+    # Grid + translation
+    braille_str, conf = reconstruct_grid(confirmed)
+    if braille_str:
+        text = translate(braille_str, selected_grade)
+    else:
+        text = st.session_state.last_result.get("text", "")
+
+    return {
+        "annotated_frame": annotated_b64,
+        "text": text,
+        "confidence": conf,
+        "guidance": guidance,
+    }
+
+
+# ─── Tabs ─────────────────────────────────────────────────────────────────────
+tab_live, tab_upload = st.tabs(["📷 Live Camera", "📁 Upload Image"])
+
+# ── Live Camera tab ───────────────────────────────────────────────────────────
+with tab_live:
+
+    @st.fragment(run_every="500ms")
+    def live_fragment():
+        frame_data = camera_component(
+            key="camera",
+            auto_speak=auto_speak,
+            speak_guidance=speak_guide,
+            result=st.session_state.last_result,
+        )
+
+        if frame_data and isinstance(frame_data, dict) and "frame" in frame_data:
+            raw = decode_frame(frame_data["frame"])
+            if raw is not None:
+                st.session_state[_COUNTER_KEY] += 1
+                result = run_pipeline(raw, st.session_state[_COUNTER_KEY], grade)
+                st.session_state.last_result = result
+
+        result = st.session_state.last_result
+        guidance_msg = result["guidance"]["message"]
+        st.markdown(f"**{guidance_msg}**")
+        conf_pct = int(result.get("confidence", 0) * 100)
+        st.progress(conf_pct, text=f"Confidence: {conf_pct}%")
+
+        text_val = result.get("text", "")
+        st.text_area("Translation", value=text_val, height=100, key="live_text_area")
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button("Copy text", key="btn_copy_live"):
+                st.toast("Use Ctrl+A / Ctrl+C in the text box above to copy")
+        with col_b:
+            if st.button("▶ Speak", key="btn_speak_live") and text_val:
+                escaped = text_val.replace("'", "\\'").replace('"', '\\"')
+                st.markdown(
+                    f"<script>window.speechSynthesis.cancel();"
+                    f"window.speechSynthesis.speak("
+                    f"new SpeechSynthesisUtterance('{escaped}'));</script>",
+                    unsafe_allow_html=True,
+                )
+
+    live_fragment()
+
+# ── Upload tab ────────────────────────────────────────────────────────────────
+with tab_upload:
+    uploaded = st.file_uploader(
+        "Upload a Braille image (JPG or PNG)",
+        type=["jpg", "jpeg", "png"],
+    )
+    if uploaded is not None:
+        file_bytes = np.frombuffer(uploaded.read(), np.uint8)
+        raw = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
+        if raw is not None:
+            result = run_pipeline(raw, counter=0, selected_grade=grade)
+
+            col1, col2 = st.columns([1, 1])
+            with col1:
+                st.image(
+                    f"data:image/jpeg;base64,{result['annotated_frame']}",
+                    caption="Detected dots (green circles)",
+                    use_container_width=True,
+                )
+            with col2:
+                st.metric("Confidence", f"{int(result['confidence'] * 100)}%")
+                st.text_area("Translation", value=result["text"], height=150)
+
+                if st.button("▶ Speak", key="btn_speak_upload") and result["text"]:
+                    escaped = result["text"].replace("'", "\\'").replace('"', '\\"')
+                    st.markdown(
+                        f"<script>window.speechSynthesis.cancel();"
+                        f"window.speechSynthesis.speak("
+                        f"new SpeechSynthesisUtterance('{escaped}'));</script>",
+                        unsafe_allow_html=True,
+                    )
+
+                if st.button("⬇ Download Audio (MP3)", key="btn_audio") and result["text"]:
+                    import asyncio
+                    import tempfile
+                    import os
+                    import edge_tts
+
+                    async def _synth(text: str) -> bytes:
+                        communicate = edge_tts.Communicate(text, voice="en-US-JennyNeural")
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as f:
+                            fname = f.name
+                        await communicate.save(fname)
+                        with open(fname, "rb") as f:
+                            data = f.read()
+                        os.unlink(fname)
+                        return data
+
+                    with st.spinner("Generating audio…"):
+                        audio_bytes = asyncio.run(_synth(result["text"]))
+                    st.download_button(
+                        "Save MP3",
+                        data=audio_bytes,
+                        file_name="braille_translation.mp3",
+                        mime="audio/mpeg",
+                    )
+        else:
+            st.error("Could not decode image. Please upload a valid JPG or PNG.")
