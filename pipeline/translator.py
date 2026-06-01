@@ -35,7 +35,16 @@ def translate(braille_unicode: str, grade: str = "grade2") -> str:
     try:
         import louis  # lazy: only imported at call time, not at module load
     except ImportError:
-        return "[liblouis unavailable — install python3-louis on Linux]"
+        # python3-louis apt package installs to system Python (/usr/lib/python3/dist-packages),
+        # not to Streamlit's virtualenv. Extend sys.path and retry before giving up.
+        import sys as _sys
+        _site = "/usr/lib/python3/dist-packages"
+        if _site not in _sys.path:
+            _sys.path.insert(0, _site)
+        try:
+            import louis
+        except ImportError:
+            return "[liblouis unavailable — install python3-louis on Linux]"
 
     tables = GRADE_TABLES.get(grade, GRADE_TABLES["grade2"])
 

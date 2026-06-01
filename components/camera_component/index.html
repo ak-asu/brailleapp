@@ -66,13 +66,27 @@ function setFrameHeight(height) {
     "*"
   );
 }
+// Track whether Streamlit has acknowledged us (responded with streamlit:render).
+// During startup, Streamlit double-mounts the iframe within ~30ms (BOOTING→RUNNING
+// transition). The first mount's componentReady can be lost if the listener hasn't
+// re-registered yet for the new instance. Retrying with backoff ensures at least one
+// message lands after the listener is stable.
+var _streamlitReady = false;
+
 window.addEventListener("message", function (e) {
   if (e.data.type === "streamlit:render") {
+    _streamlitReady = true;
     onRender(e.data.args || {});
   }
 });
-// Signal component is ready
-window.parent.postMessage({ type: "streamlit:componentReady", apiVersion: 1 }, "*");
+
+function _postReady() {
+  window.parent.postMessage({ type: "streamlit:componentReady", apiVersion: 1 }, "*");
+}
+_postReady();
+[100, 300, 700, 1500, 3000, 5000, 7500].forEach(function(ms) {
+  setTimeout(function() { if (!_streamlitReady) _postReady(); }, ms);
+});
 
 // ─── State ────────────────────────────────────────────────────────────────────
 const video    = document.getElementById("video");
