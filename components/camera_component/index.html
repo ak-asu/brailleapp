@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #1a1a1a; color: #fff; font-family: sans-serif; }
+
+  #container { position: relative; width: 100%; }
+  video { width: 100%; display: block; border-radius: 8px; }
+  canvas#overlay {
+    position: absolute; top: 0; left: 0;
+    width: 100%; height: 100%;
+    border-radius: 8px; pointer-events: none;
+  }
+
+  #guidance {
+    padding: 8px 12px; font-size: 1em;
+    background: rgba(0,0,0,0.6); border-radius: 4px; margin: 6px 0;
+    min-height: 2em;
+  }
+  #guidance.warn { color: #ffcc00; }
+  #guidance.ok   { color: #66ff66; }
+
+  #conf-bar { height: 6px; background: #333; border-radius: 3px; margin: 4px 0 8px; }
+  #conf-fill { height: 100%; background: #4CAF50; border-radius: 3px;
+               width: 0%; transition: width 0.4s ease; }
+
+  #controls { display: flex; gap: 8px; flex-wrap: wrap; padding: 4px 0; }
+  button {
+    padding: 10px 18px; font-size: 0.95em; border: none;
+    border-radius: 8px; cursor: pointer; background: #333; color: #fff;
+    flex: 1; min-width: 100px;
+  }
+  button:active { background: #555; }
+
+  #error { color: #ff5555; padding: 12px; display: none; }
+</style>
+</head>
+<body>
+
+<div id="container">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="overlay"></canvas>
+</div>
+<div id="guidance" class="ok">Initialising camera…</div>
+<div id="conf-bar"><div id="conf-fill"></div></div>
+<div id="controls">
+  <button id="btn-pause">⏸ Pause</button>
+  <button id="btn-flip">↺ Flip</button>
+</div>
+<div id="error"></div>
+
+<script>
+// ─── Streamlit component protocol (raw postMessage, no external CDN) ──────────
+function setComponentValue(value) {
+  window.parent.postMessage(
+    { type: "streamlit:setComponentValue", value: value, dataType: "json" },
+    "*"
+  );
+}
+function setFrameHeight(height) {
+  window.parent.postMessage(
+    { type: "streamlit:setFrameHeight", height: height },
+    "*"
+  );
+}
+window.addEventListener("message", function (e) {
+  if (e.data.type === "streamlit:render") {
+    onRender(e.data.args || {});
+  }
+});
+// Signal component is ready
+window.parent.postMessage({ type: "streamlit:componentReady", apiVersion: 1 }, "*");
+
+// ─── State ────────────────────────────────────────────────────────────────────
+const video    = document.getElementById("video");
+const overlay  = document.getElementById("overlay");
+const ctx      = overlay.getContext("2d");
+const guideEl  = document.getElementById("guidance");
+const confFill = document.getElementById("conf-fill");
+const errEl    = document.getElementById("error");
+
+let stream         = null;
+let captureTimer   = null;
+let paused         = false;
+let facingMode     = "environment";
+let autoSpeak      = false;
+let speakGuidance  = false;
+let lastSpokenText = "";
+let isCapturing    = false;   // prevent overlapping captures
+
+// ─── Camera ───────────────────────────────────────────────────────────────────
+async function startCamera(facing) {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: facing,
+        width:  { ideal: 1280 },
+        height: { ideal: 720 }
+      }
+    });
+    video.srcObject = stream;
+    await video.play();
+    overlay.width  = video.videoWidth  || 640;
+    overlay.height = video.videoHeight || 480;
+    setFrameHeight(overlay.height + 120);
+    errEl.style.display = "none";
+  } catch (err) {
+    errEl.textContent = "Camera error: " + err.message;
+    errEl.style.display = "block";
+  }
+}
+
+// ─── Frame capture ─────────────────────────────────────────────────────────
+function captureFrame() {
+  if (paused || isCapturing || !video.videoWidth) return;
+  isCapturing = true;
+
+  const tmp = document.createElement("canvas");
+  tmp.width  = video.videoWidth;
+  tmp.height = video.videoHeight;
+  tmp.getContext("2d").drawImage(video, 0, 0);
+
+  tmp.toBlob(blob => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const b64 = reader.result.split(",")[1];
+      setComponentValue({ frame: b64, ts: Date.now() });
+      isCapturing = false;
+    };
+    reader.readAsDataURL(blob);
+  }, "image/jpeg", 0.85);
+}
+
+// ─── Result display ────────────────────────────────────────────────────────
+function updateDisplay(result) {
+  if (!result) return;
+
+  // Annotated frame overlay
+  if (result.annotated_frame) {
+    const img = new Image();
+    img.onload = () => {
+      ctx.clearRect(0, 0, overlay.width, overlay.height);
+      ctx.globalAlpha = 0.55;
+      ctx.drawImage(img, 0, 0, overlay.width, overlay.height);
+      ctx.globalAlpha = 1.0;
+    };
+    img.src = "data:image/jpeg;base64," + result.annotated_frame;
+  }
+
+  // Guidance
+  if (result.guidance) {
+    const g = result.guidance;
+    guideEl.textContent = g.message || "";
+    guideEl.className   = g.status === "ok" ? "ok" : "warn";
+    if (speakGuidance && g.status === "warn") speakText(g.message);
+  }
+
+  // Confidence bar
+  if (result.confidence !== undefined) {
+    confFill.style.width = Math.round(result.confidence * 100) + "%";
+  }
+
+  // Auto-speak translated text
+  if (autoSpeak && result.text && result.text !== lastSpokenText) {
+    lastSpokenText = result.text;
+    speakText(result.text);
+  }
+}
+
+// ─── Web Speech API ────────────────────────────────────────────────────────
+function speakText(text) {
+  if (!text || !("speechSynthesis" in window)) return;
+  window.speechSynthesis.cancel();
+  const utt  = new SpeechSynthesisUtterance(text);
+  utt.lang   = "en-US";
+  utt.rate   = 0.9;
+  window.speechSynthesis.speak(utt);
+}
+
+// ─── Controls ──────────────────────────────────────────────────────────────
+document.getElementById("btn-pause").addEventListener("click", () => {
+  paused = !paused;
+  document.getElementById("btn-pause").textContent = paused ? "▶ Resume" : "⏸ Pause";
+});
+
+document.getElementById("btn-flip").addEventListener("click", () => {
+  facingMode = facingMode === "environment" ? "user" : "environment";
+  startCamera(facingMode);
+});
+
+// ─── Streamlit render callback ─────────────────────────────────────────────
+function onRender(args) {
+  autoSpeak     = !!args.auto_speak;
+  speakGuidance = !!args.speak_guidance;
+  updateDisplay(args.result || null);
+}
+
+// ─── Boot ──────────────────────────────────────────────────────────────────
+startCamera(facingMode).then(() => {
+  captureTimer = setInterval(captureFrame, 300);
+});
+</script>
+</body>
+</html>
