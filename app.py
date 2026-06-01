@@ -9,11 +9,25 @@ from pipeline.detector import load_onnx_session, detect_hough, detect_onnx, ense
 from pipeline.grid import reconstruct_grid, _cluster_1d
 from pipeline.corrector import estimate_skew, correct_skew
 from pipeline.translator import translate
-from utils.image_utils import decode_frame, encode_frame, letterbox, draw_dots
+from pipeline.runtime import (
+    should_run_onnx,
+    should_hold_for_blur,
+    with_guidance,
+    is_new_frame,
+)
+from utils.image_utils import (
+    decode_frame,
+    encode_frame,
+    letterbox,
+    draw_dots,
+    map_dots_from_letterbox,
+)
 from utils.quality import blur_score, brightness, dot_density, get_guidance
 
-MODEL_PATH = "models/yolov8n_braille.onnx"
+MODEL_PATH = "models/yolov8n_braille_combined.onnx"
 _COUNTER_KEY = "frame_counter"
+_PROCESSING_KEY = "processing_frame"
+_LAST_TS_KEY = "last_frame_ts"
 
 # ─── Page config (must be first Streamlit call) ───────────────────────────────
 st.set_page_config(
@@ -50,20 +64,83 @@ with st.sidebar:
     large_text    = st.checkbox("Large text", value=False)
 
 # ─── CSS injection ────────────────────────────────────────────────────────────
-_bg = "#000" if high_contrast else "#fff"
-_fg = "#fff" if high_contrast else "#000"
-_sz = "1.4em" if large_text  else "1em"
-st.markdown(f"""
-<style>
-section[data-testid="stMain"] > div {{ background: {_bg}; color: {_fg}; }}
-.translation-box {{ font-size: {_sz}; font-family: monospace; }}
-</style>
-""", unsafe_allow_html=True)
+_sz = "1.4em" if large_text else "1em"
+_hc = """
+html, body,
+[data-testid="stApp"],
+[data-testid="stAppViewContainer"] {
+    background-color: #000 !important;
+}
+header[data-testid="stHeader"] {
+    background-color: #000 !important;
+    border-bottom: 1px solid #333 !important;
+}
+section[data-testid="stSidebar"],
+section[data-testid="stSidebar"] > div,
+section[data-testid="stSidebar"] > div > div {
+    background-color: #0d0d0d !important;
+}
+section[data-testid="stSidebar"] p,
+section[data-testid="stSidebar"] span,
+section[data-testid="stSidebar"] label,
+section[data-testid="stSidebar"] small,
+section[data-testid="stSidebar"] h1,
+section[data-testid="stSidebar"] h2,
+section[data-testid="stSidebar"] h3 {
+    color: #e8e8e8 !important;
+}
+section[data-testid="stMain"] > div,
+.block-container {
+    background-color: #000 !important;
+    color: #fff !important;
+}
+section[data-testid="stMain"] h1,
+section[data-testid="stMain"] h2,
+section[data-testid="stMain"] h3,
+section[data-testid="stMain"] p,
+section[data-testid="stMain"] label,
+section[data-testid="stMain"] span {
+    color: #e8e8e8 !important;
+}
+button[data-testid^="stBaseButton"] {
+    background-color: #1e1e1e !important;
+    color: #fff !important;
+    border: 1px solid #444 !important;
+}
+button[data-testid^="stBaseButton"]:hover {
+    background-color: #333 !important;
+}
+.stTextArea textarea {
+    background-color: #111 !important;
+    color: #fff !important;
+    border-color: #444 !important;
+}
+[data-testid="stFileUploaderDropzone"] {
+    background-color: #111 !important;
+    border-color: #555 !important;
+}
+[data-testid="stFileUploaderDropzone"] p,
+[data-testid="stFileUploaderDropzone"] span {
+    color: #aaa !important;
+}
+[data-testid="stSelectbox"] > div > div {
+    background-color: #1e1e1e !important;
+    color: #fff !important;
+}
+.stProgress > div > div { background-color: #222 !important; }
+[data-testid="stMetricValue"],
+[data-testid="stMetricLabel"] { color: #fff !important; }
+""" if high_contrast else ""
+
+st.markdown(f"""<style>
+.stTextArea textarea {{ font-size: {_sz}; font-family: monospace; }}
+{_hc}
+</style>""", unsafe_allow_html=True)
 
 # ─── Title ────────────────────────────────────────────────────────────────────
 st.title("⠃ Braille Scanner")
 if onnx_session is None:
-    st.caption("Hough-only mode (ONNX model not found — place yolov8n_braille.onnx in models/)")
+    st.caption("Hough-only mode (ONNX model not found — place yolov8n_braille_combined.onnx in models/)")
 
 # ─── Session state init ───────────────────────────────────────────────────────
 if "last_result" not in st.session_state:
@@ -74,6 +151,10 @@ if "last_result" not in st.session_state:
     }
 if _COUNTER_KEY not in st.session_state:
     st.session_state[_COUNTER_KEY] = 0
+if _PROCESSING_KEY not in st.session_state:
+    st.session_state[_PROCESSING_KEY] = False
+if _LAST_TS_KEY not in st.session_state:
+    st.session_state[_LAST_TS_KEY] = None
 
 
 # ─── Pipeline helper ──────────────────────────────────────────────────────────
@@ -96,7 +177,7 @@ def run_pipeline(raw_bgr: np.ndarray, counter: int, selected_grade: str) -> dict
     hough_raw = detect_hough(binary, gray)
 
     # Stage 2B: ONNX every 3rd cycle
-    if onnx_session and counter % 3 == 0:
+    if should_run_onnx(onnx_session, counter, target_size):
         onnx_raw = detect_onnx(frame_s, onnx_session)
         confirmed = ensemble(hough_raw, onnx_raw)
     else:
@@ -116,7 +197,7 @@ def run_pipeline(raw_bgr: np.ndarray, counter: int, selected_grade: str) -> dict
             frame_s = correct_skew(frame_s, skew)
             binary, gray = preprocess(frame_s, clip_limit=clip)
             hough_raw = detect_hough(binary, gray)
-            if onnx_session and counter % 3 == 0:
+            if should_run_onnx(onnx_session, counter, target_size):
                 onnx_raw = detect_onnx(frame_s, onnx_session)
                 confirmed = ensemble(hough_raw, onnx_raw)
             else:
@@ -124,9 +205,18 @@ def run_pipeline(raw_bgr: np.ndarray, counter: int, selected_grade: str) -> dict
 
     guidance = get_guidance(b_score, bright, density, skew)
 
-    # Draw dot overlays
-    draw_list = [(x, y, 5.0) for x, y, _ in confirmed]
-    annotated = draw_dots(frame_s, draw_list)
+    if should_hold_for_blur(b_score):
+        return with_guidance(st.session_state.last_result, guidance)
+
+    # Draw overlays on the original camera frame so the JS overlay aspect ratio
+    # matches the live video instead of a square letterboxed processing frame.
+    draw_list = map_dots_from_letterbox(
+        [(x, y, 5.0) for x, y, _ in confirmed],
+        scale=scale,
+        pad=(pad_x, pad_y),
+        original_shape=raw_bgr.shape,
+    )
+    annotated = draw_dots(raw_bgr, draw_list)
     annotated_b64 = encode_frame(annotated)
 
     # Grid + translation
@@ -159,12 +249,23 @@ with tab_live:
             result=st.session_state.last_result,
         )
 
-        if frame_data and isinstance(frame_data, dict) and "frame" in frame_data:
+        if (
+            frame_data
+            and isinstance(frame_data, dict)
+            and "frame" in frame_data
+            and not st.session_state[_PROCESSING_KEY]
+            and is_new_frame(frame_data, st.session_state[_LAST_TS_KEY])
+        ):
             raw = decode_frame(frame_data["frame"])
             if raw is not None:
-                st.session_state[_COUNTER_KEY] += 1
-                result = run_pipeline(raw, st.session_state[_COUNTER_KEY], grade)
-                st.session_state.last_result = result
+                st.session_state[_PROCESSING_KEY] = True
+                try:
+                    st.session_state[_COUNTER_KEY] += 1
+                    st.session_state[_LAST_TS_KEY] = frame_data.get("ts")
+                    result = run_pipeline(raw, st.session_state[_COUNTER_KEY], grade)
+                    st.session_state.last_result = result
+                finally:
+                    st.session_state[_PROCESSING_KEY] = False
 
         result = st.session_state.last_result
         guidance_msg = result["guidance"]["message"]

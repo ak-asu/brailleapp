@@ -91,6 +91,34 @@ def test_reconstruct_grid_two_cells():
     assert len(braille_str.replace('\n', '')) == 2
 
 
+def test_reconstruct_grid_two_sparse_a_cells_do_not_merge():
+    dots = [
+        (100.0, 100.0, 0.9),  # dot 1 in cell 1
+        (200.0, 100.0, 0.9),  # dot 1 in cell 2
+    ]
+    braille_str, conf = reconstruct_grid(dots, dot_spacing=20.0)
+    assert braille_str == '⠁⠁'
+
+
+def test_reconstruct_grid_preserves_single_dot_position():
+    # Dot 5 should remain dot 5 even when all top/left anchors are missing.
+    dots = [(120.0, 120.0, 0.9)]
+    braille_str, conf = reconstruct_grid(
+        dots,
+        dot_spacing=20.0,
+        origin=(100.0, 100.0),
+    )
+    assert braille_str == '⠐'
+
+
+def test_reconstruct_grid_handles_missing_left_column():
+    # 'c' is dots 1 and 4. This checks that a right-column dot is not
+    # collapsed into the left column when the middle/bottom rows are absent.
+    dots = _cell_dots(origin_x=100, origin_y=100, spacing=20, pattern=0b001001)
+    braille_str, conf = reconstruct_grid(dots, dot_spacing=20.0)
+    assert braille_str == '⠉'
+
+
 def test_reconstruct_grid_too_few_dots_returns_empty():
     dots = [(100.0, 100.0, 0.9), (110.0, 100.0, 0.9)]  # only 2 dots
     braille_str, conf = reconstruct_grid(dots, min_dots=3)  # explicit quality gate

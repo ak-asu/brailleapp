@@ -113,7 +113,7 @@ def _nms(
 def detect_onnx(
     frame_bgr: np.ndarray,
     session,
-    conf_threshold: float = 0.4,
+    conf_threshold: float = 0.25,
     iou_threshold: float = 0.45,
 ) -> list[tuple[float, float, float]]:
     """

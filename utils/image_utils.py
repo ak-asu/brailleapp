@@ -61,3 +61,24 @@ def draw_dots(
     for x, y, r in dots:
         cv2.circle(out, (int(x), int(y)), max(int(r), 4), color, thickness)
     return out
+
+
+def map_dots_from_letterbox(
+    dots: list[tuple[float, float, float]],
+    scale: float,
+    pad: tuple[int, int],
+    original_shape: tuple[int, ...],
+) -> list[tuple[float, float, float]]:
+    """Map dot coordinates from a letterboxed image back to the original frame."""
+    if scale <= 0:
+        return []
+
+    pad_x, pad_y = pad
+    h, w = original_shape[:2]
+    mapped: list[tuple[float, float, float]] = []
+    for x, y, r in dots:
+        ox = (x - pad_x) / scale
+        oy = (y - pad_y) / scale
+        if 0 <= ox < w and 0 <= oy < h:
+            mapped.append((float(ox), float(oy), float(r) / scale))
+    return mapped

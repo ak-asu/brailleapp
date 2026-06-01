@@ -111,6 +111,7 @@ async function startCamera(facing) {
   } catch (err) {
     errEl.textContent = "Camera error: " + err.message;
     errEl.style.display = "block";
+    setComponentValue(null);
   }
 }
 

@@ -2,7 +2,13 @@ import base64
 import cv2
 import numpy as np
 import pytest
-from utils.image_utils import decode_frame, encode_frame, letterbox, draw_dots
+from utils.image_utils import (
+    decode_frame,
+    encode_frame,
+    letterbox,
+    draw_dots,
+    map_dots_from_letterbox,
+)
 
 
 def _make_jpeg_b64(w=100, h=80) -> str:
@@ -71,3 +77,14 @@ def test_draw_dots_draws_circle():
     result = draw_dots(frame, dots)
     # At least some pixels changed from black
     assert result.sum() > 0
+
+
+def test_map_dots_from_letterbox_removes_padding_and_scale():
+    dots = [(320.0, 320.0, 10.0), (10.0, 10.0, 5.0)]
+    mapped = map_dots_from_letterbox(
+        dots,
+        scale=1.0,
+        pad=(0, 80),
+        original_shape=(480, 640, 3),
+    )
+    assert mapped == [(320.0, 240.0, 10.0)]
