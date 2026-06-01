@@ -1,11 +1,15 @@
 import os
-import streamlit.components.v1 as components
+import streamlit as st
 
-_COMPONENT_DIR = os.path.dirname(os.path.abspath(__file__))
+_dir = os.path.dirname(os.path.abspath(__file__))
 
-# Declares the component, pointing Streamlit at the directory containing index.html.
-# Streamlit serves index.html from this directory over HTTPS (Community Cloud).
-camera_component = components.declare_component(
+with open(os.path.join(_dir, "camera_v2.html"), encoding="utf-8") as f:
+    _html = f.read()
+with open(os.path.join(_dir, "camera_v2.js"), encoding="utf-8") as f:
+    _js = f.read()
+
+camera_component = st.components.v2.component(
     "camera_component",
-    path=_COMPONENT_DIR,
+    html=_html,
+    js=_js,
 )

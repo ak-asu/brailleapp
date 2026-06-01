@@ -240,14 +240,21 @@ tab_live, tab_upload = st.tabs(["📷 Live Camera", "📁 Upload Image"])
 # ── Live Camera tab ───────────────────────────────────────────────────────────
 with tab_live:
 
-    @st.fragment(run_every="500ms")
+    @st.fragment
     def live_fragment():
-        frame_data = camera_component(
+        def _on_frame():
+            pass  # fragment reruns automatically when a frame trigger fires
+
+        cam_result = camera_component(
+            data={
+                "auto_speak": auto_speak,
+                "speak_guidance": speak_guide,
+                "result": st.session_state.last_result,
+            },
+            on_frame_change=_on_frame,
             key="camera",
-            auto_speak=auto_speak,
-            speak_guidance=speak_guide,
-            result=st.session_state.last_result,
         )
+        frame_data = getattr(cam_result, "frame", None)
 
         if (
             frame_data
