@@ -229,7 +229,7 @@ def run_pipeline(raw_bgr: np.ndarray, counter: int, selected_grade: str) -> dict
     return {
         "annotated_frame": annotated_b64,
         "text": text,
-        "confidence": conf,
+        "confidence": float(conf),  # numpy.float64 is not JSON-serialisable
         "guidance": guidance,
     }
 
@@ -240,18 +240,14 @@ tab_live, tab_upload = st.tabs(["📷 Live Camera", "📁 Upload Image"])
 # ── Live Camera tab ───────────────────────────────────────────────────────────
 with tab_live:
 
-    @st.fragment
+    @st.fragment(run_every="500ms")
     def live_fragment():
-        def _on_frame():
-            pass  # fragment reruns automatically when a frame trigger fires
-
         cam_result = camera_component(
             data={
                 "auto_speak": auto_speak,
                 "speak_guidance": speak_guide,
                 "result": st.session_state.last_result,
             },
-            on_frame_change=_on_frame,
             key="camera",
         )
         frame_data = getattr(cam_result, "frame", None)
